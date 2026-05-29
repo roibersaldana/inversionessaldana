@@ -1730,17 +1730,17 @@ th, td,
                 }
                 DB_KEYS.forEach(k => {
                     if (all[k] === undefined) {
-                        if (Storage.esClaveObjetoDirecto(k)) localStorage.removeItem(lsKey(k));
-                        else localStorage.setItem(lsKey(k), '[]');
+                        if (Storage.esClaveObjetoDirecto(k)) IDBStore.removeSync(lsKey(k));
+                        else IDBStore.setSync(lsKey(k), '[]');
                         return;
                     }
                     const val = normalizarDatoFirebasePorClave(k, all[k]);
-                    localStorage.setItem(lsKey(k), JSON.stringify(val));
+                    IDBStore.setSync(lsKey(k), JSON.stringify(val));
                 });
                 Object.keys(all).forEach(k => {
                     if (!k.startsWith('caja_u')) return;
                     const val = normalizarDatoFirebasePorClave(k, all[k]);
-                    localStorage.setItem(lsKey(k), JSON.stringify(val));
+                    IDBStore.setSync(lsKey(k), JSON.stringify(val));
                 });
                 if (all[CLOUD_META_KEY]) {
                     localStorage.setItem(CLOUD_META_KEY, JSON.stringify(all[CLOUD_META_KEY]));
@@ -1777,10 +1777,129 @@ th, td,
         const LS_PREFIX = 'v2_';
         function lsKey(key) { return LS_PREFIX + key; }
 
+        // ==================== CAPA IndexedDB (reemplaza localStorage para datos de negocio) ====================
+        // Usa un cache en memoria para lectura síncrona instantánea.
+        // Escribe en IndexedDB en background. Migra automáticamente desde localStorage al primer arranque.
+        const IDBStore = (() => {
+            const DB_NAME = 'SaldanaIDB';
+            const STORE_NAME = 'kv';
+            const DB_VERSION = 1;
+            const MIG_FLAG = '_idb_migrated_v1';
+            let _db = null;
+            let _cache = {}; // cache en memoria — clave completa (con prefijo)
+            let _ready = false;
+
+            function openDB() {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(DB_NAME, DB_VERSION);
+                    req.onupgradeneeded = e => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains(STORE_NAME)) {
+                            db.createObjectStore(STORE_NAME);
+                        }
+                    };
+                    req.onsuccess = e => resolve(e.target.result);
+                    req.onerror = e => reject(e.target.error);
+                });
+            }
+
+            function idbPut(key, value) {
+                if (!_db) return;
+                try {
+                    const tx = _db.transaction(STORE_NAME, 'readwrite');
+                    tx.objectStore(STORE_NAME).put(value, key);
+                } catch(e) { console.warn('[IDB] put error', key, e); }
+            }
+
+            function idbDelete(key) {
+                if (!_db) return;
+                try {
+                    const tx = _db.transaction(STORE_NAME, 'readwrite');
+                    tx.objectStore(STORE_NAME).delete(key);
+                } catch(e) { console.warn('[IDB] delete error', key, e); }
+            }
+
+            async function migrateFromLocalStorage(db) {
+                // Migrar todas las claves con prefijo v2_ desde localStorage → IndexedDB
+                const keysToMigrate = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.startsWith(LS_PREFIX)) keysToMigrate.push(k);
+                }
+                if (!keysToMigrate.length) return;
+                const tx = db.transaction(STORE_NAME, 'readwrite');
+                const store = tx.objectStore(STORE_NAME);
+                keysToMigrate.forEach(k => {
+                    const raw = localStorage.getItem(k);
+                    if (raw !== null) {
+                        try { store.put(raw, k); } catch(e) {}
+                    }
+                });
+                await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+                console.log('[IDB] Migración completada:', keysToMigrate.length, 'claves migradas desde localStorage');
+            }
+
+            async function init() {
+                try {
+                    _db = await openDB();
+                    const alreadyMigrated = localStorage.getItem(MIG_FLAG) === '1';
+                    if (!alreadyMigrated) {
+                        await migrateFromLocalStorage(_db);
+                        localStorage.setItem(MIG_FLAG, '1');
+                    }
+                    // Cargar TODO en cache desde IndexedDB
+                    const tx = _db.transaction(STORE_NAME, 'readonly');
+                    const store = tx.objectStore(STORE_NAME);
+                    const getAllKeys = () => new Promise((res, rej) => { const r = store.getAllKeys(); r.onsuccess = () => res(r.result); r.onerror = rej; });
+                    const getAllVals = () => new Promise((res, rej) => { const r = store.getAll(); r.onsuccess = () => res(r.result); r.onerror = rej; });
+                    const [keys, vals] = await Promise.all([getAllKeys(), getAllVals()]);
+                    keys.forEach((k, i) => { _cache[k] = vals[i]; });
+                    _ready = true;
+                    console.log('[IDB] Listo. Cache cargado:', Object.keys(_cache).length, 'claves');
+                } catch(e) {
+                    console.warn('[IDB] Fallo al inicializar, usando localStorage como fallback:', e);
+                    _ready = true; // marcar ready para no bloquear
+                }
+            }
+
+            return {
+                init,
+                isReady() { return _ready; },
+
+                // Lectura síncrona desde cache (inmediata)
+                getSync(key) {
+                    if (_cache.hasOwnProperty(key)) return _cache[key];
+                    // fallback a localStorage si el cache todavía no está listo
+                    return localStorage.getItem(key);
+                },
+
+                // Escritura síncrona en cache + async en IndexedDB
+                setSync(key, value) {
+                    _cache[key] = value;
+                    idbPut(key, value);
+                    // Mantener localStorage sincronizado para compatibilidad con código externo a Storage
+                    try { localStorage.setItem(key, value); } catch(e) {}
+                },
+
+                // Eliminar del cache + IndexedDB
+                removeSync(key) {
+                    delete _cache[key];
+                    idbDelete(key);
+                    try { localStorage.removeItem(key); } catch(e) {}
+                },
+
+                // Acceso directo al cache (solo lectura)
+                get cache() { return _cache; }
+            };
+        })();
+
+        // Arrancar IndexedDB de inmediato (antes de que el usuario interactúe)
+        IDBStore.init();
+
         class Storage {
-            // Lectura siempre desde localStorage (rápida, sin esperar red)
+            // Lectura desde cache en memoria (IDBStore), sin esperar red
             static get(key) {
-                const data = localStorage.getItem(lsKey(key));
+                const data = IDBStore.getSync(lsKey(key));
                 return data ? JSON.parse(data) : null;
             }
 
@@ -1946,7 +2065,7 @@ th, td,
                 const isArrayLike = Array.isArray(value) && !this.esClaveObjetoDirecto(key);
                 const toStore = isArrayLike ? this._prepareArrayForStorage(key, value) : value;
 
-                localStorage.setItem(lsKey(key), JSON.stringify(toStore));
+                IDBStore.setSync(lsKey(key), JSON.stringify(toStore));
                 this._lastWrite[key] = Date.now();
 
                 if (IS_LOCAL_MASTER) {
@@ -2094,8 +2213,8 @@ th, td,
                 let changed = false;
                 cambios.forEach(([key, val]) => {
                     const str = JSON.stringify(val);
-                    if (localStorage.getItem(lsKey(key)) !== str) {
-                        localStorage.setItem(lsKey(key), str);
+                    if (IDBStore.getSync(lsKey(key)) !== str) {
+                        IDBStore.setSync(lsKey(key), str);
                         changed = true;
                     }
                 });
@@ -2130,8 +2249,8 @@ th, td,
                     if (Date.now() - lastWrite < 2500) return;
                     const incoming = normalizarListaFirebaseRapida(snap.val());
                     const incomingStr = JSON.stringify(incoming);
-                    if (localStorage.getItem(lsKey(key)) === incomingStr) return;
-                    localStorage.setItem(lsKey(key), incomingStr);
+                    if (IDBStore.getSync(lsKey(key)) === incomingStr) return;
+                    IDBStore.setSync(lsKey(key), incomingStr);
                     if (currentUser) updateDashboard();
                     if (_activeModule === 'mensajes') {
                         const modalAbierto = document.querySelector('.modal.active');
@@ -2171,13 +2290,13 @@ th, td,
             DB_KEYS.forEach(k => {
                 if (cloudData[k] === undefined) return;
                 const val = normalizarDatoFirebasePorClave(k, cloudData[k]);
-                localStorage.setItem(lsKey(k), JSON.stringify(val));
+                IDBStore.setSync(lsKey(k), JSON.stringify(val));
             });
 
             Object.keys(cloudData).forEach(k => {
                 if (!k.startsWith('caja_u')) return;
                 const val = normalizarDatoFirebasePorClave(k, cloudData[k]);
-                localStorage.setItem(lsKey(k), JSON.stringify(val));
+                IDBStore.setSync(lsKey(k), JSON.stringify(val));
             });
 
             localStorage.setItem('_cloudDataLoaded', 'true');
@@ -2430,7 +2549,7 @@ th, td,
                         case 'ingresosCaja':  renderIngresosCaja(); break;
                         case 'ingresos':      renderIngresos(); break;
                         case 'trabajadores':  renderTrabajadores(); break;
-                        case 'fierros':       renderFierros(); break;
+                        case 'fierros':       repararRegistrosFierros(true); renderFierros(); break;
                         case 'proveedores':   renderProveedores(); break;
                         case 'compras':       renderCompras(); break;
                         case 'usuarios':      renderUsuarios(); break;
@@ -2613,7 +2732,7 @@ th, td,
 
             ['pedidos', 'ventas', 'compras', 'gastos', 'ingresos', 'creditos',
              'productos', 'clientes', 'proveedores', 'trabajadores', 'fierros'].forEach(key => {
-                if (localStorage.getItem(lsKey(key)) === null) Storage.set(key, []);
+                if (IDBStore.getSync(lsKey(key)) === null) Storage.set(key, []);
             });
 
             // Caja
@@ -2656,7 +2775,7 @@ th, td,
             ]);
             ['pedidos', 'ventas', 'compras', 'gastos', 'ingresos', 'creditos',
              'productos', 'clientes', 'proveedores', 'trabajadores', 'fierros'].forEach(key => {
-                if (localStorage.getItem(lsKey(key)) === null) Storage.set(key, []);
+                if (IDBStore.getSync(lsKey(key)) === null) Storage.set(key, []);
             });
             if (!Storage.get(getCajaKey())) {
                 Storage.set(getCajaKey(), { estado: 'cerrada', montoInicial: 0, montoActual: 0 });
@@ -4201,6 +4320,7 @@ th, td,
                     renderTrabajadores();
                     break;
                 case 'fierros':
+                    repararRegistrosFierros(true); // ✅ reparación automática silenciosa
                     renderFierros();
                     break;
                 case 'cierreCaja':
@@ -6873,7 +6993,7 @@ th, td,
 
         async function marcarColeccionEliminada(key) {
             if (Storage.esClaveObjetoDirecto && Storage.esClaveObjetoDirecto(key)) {
-                localStorage.removeItem(lsKey(key));
+                IDBStore.removeSync(lsKey(key));
                 // ✅ FIX: Siempre limpiar en Firebase, sin importar el modo
                 if (_fbReady && _db) {
                     try { await _db.ref(`saldana_v2/${key}`).remove(); } catch(e) {}
@@ -8052,6 +8172,13 @@ ${lista}
                                     </select>
                                 </div>
                                 ${cuadroPagoMetodosHTML('pdc','pdcTotalLabel')}
+                                <div id="pdcConfirmarBVWrap" style="display:none;margin-top:12px;background:#fff8e1;border:2px solid #ffd54f;border-radius:10px;padding:12px 14px;">
+                                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:700;font-size:15px;color:#e65100;">
+                                        <input type="checkbox" id="pdcConfirmarDevolucionBV" style="width:20px;height:20px;accent-color:#e65100;cursor:pointer;">
+                                        🪣 El cliente devuelve los balones vacíos ahora
+                                    </label>
+                                    <div id="pdcResumenBV" style="font-size:13px;color:#666;margin-top:6px;margin-left:30px;"></div>
+                                </div>
                                 <div class="flex gap-2 mt-4">
                                     <button onclick="confirmarPagoDesdeCliente()" class="btn btn-success" style="flex:1;padding:14px;">✅ Registrar Pago</button>
                                     <button onclick="cerrarModal('modalPagoDesdeCliente')" class="btn btn-secondary">Cancelar</button>
@@ -8449,20 +8576,27 @@ ${lista}
 
             // Agrupar por dirección
             const dirMap = {};
-            // Obtener todas las direcciones de los pedidos del cliente
+            // Mapa pedidoId → dirección (para enlazar créditos con su dirección correcta)
+            const pedidoDirMap = {};
             pedidos.forEach(p => {
                 const dir = (p.clienteDireccion || '').trim() || (c.direccion || '') || '(Sin dirección)';
-                if (!dirMap[dir]) dirMap[dir] = { credito: null, fierrosDir: [], fechaUlt: '' };
+                pedidoDirMap[p.id] = dir;
+                if (!dirMap[dir]) dirMap[dir] = { creditosList: [], fierrosDir: [], fechaUlt: '', saldoTotal: 0 };
                 if (!dirMap[dir].fechaUlt || p.fecha > dirMap[dir].fechaUlt) dirMap[dir].fechaUlt = p.fecha;
             });
             // Si no hay pedidos, usar dirección del cliente
             if (!Object.keys(dirMap).length) {
                 const dir = c.direccion || '(Sin dirección)';
-                dirMap[dir] = { credito: null, fierrosDir: [], fechaUlt: '' };
+                dirMap[dir] = { creditosList: [], fierrosDir: [], fechaUlt: '', saldoTotal: 0 };
             }
-            // Asignar crédito a la dirección más reciente (el sistema acumula por cliente)
             const dirs = Object.keys(dirMap).sort((a,b) => (dirMap[b].fechaUlt||'').localeCompare(dirMap[a].fechaUlt||''));
-            if (creditos.length) dirMap[dirs[0]].credito = creditos[0];
+            // Asignar CADA crédito a la dirección de SU pedido (no solo al más reciente)
+            creditos.forEach(cr => {
+                const dirCr = pedidoDirMap[cr.pedidoId] || dirs[0];
+                if (!dirMap[dirCr]) dirMap[dirCr] = { creditosList: [], fierrosDir: [], fechaUlt: '', saldoTotal: 0 };
+                dirMap[dirCr].creditosList.push(cr);
+                dirMap[dirCr].saldoTotal = (dirMap[dirCr].saldoTotal || 0) + (cr.saldo || 0);
+            });
             // Asignar fierros por dirección exacta
             fierros.forEach(f => {
                 const fd = (f.direccion || '').trim();
@@ -8486,17 +8620,18 @@ ${lista}
                 const bvTotal = bvMap.b10+bvMap.b5+bvMap.b45;
                 if (!tieneCredito && bvTotal===0) return;
 
-                const crId = g.credito ? g.credito.id : '';
-                const saldo = g.credito ? g.credito.saldo : 0;
+                const creditoIds = (g.creditosList||[]).map(cr => cr.id);
+                const saldoTotal = g.saldoTotal || 0;
                 const fecha = g.fechaUlt ? g.fechaUlt.substring(0,10) : '';
+                const dirKey = dir.replace(/[^a-z0-9]/gi,'_');
 
-                html += `<div id="pdcDir_${crId||dir.replace(/[^a-z0-9]/gi,'_')}"
-                    onclick="seleccionarDireccionPDC(${JSON.stringify(crId)}, ${JSON.stringify(dir)}, ${JSON.stringify(bvMap)}, ${saldo})"
+                html += `<div id="pdcDir_${dirKey}"
+                    onclick="seleccionarDireccionPDC(${JSON.stringify(creditoIds)}, ${JSON.stringify(dir)}, ${JSON.stringify(bvMap)}, ${saldoTotal})"
                     style="border:2px solid #e0e0e0;border-radius:12px;padding:12px 14px;cursor:pointer;transition:all .2s;background:white;">
                     <div style="font-size:13px;font-weight:700;color:#2d5016;margin-bottom:4px;">📍 ${dir}</div>
                     ${fecha ? `<div style="font-size:11px;color:#aaa;margin-bottom:6px;">Último pedido: ${fecha}</div>` : ''}
                     <div style="display:flex;flex-wrap:wrap;gap:6px;">
-                        ${tieneCredito ? `<span style="background:#fff3e0;border:1.5px solid #ffb74d;border-radius:8px;padding:3px 9px;font-size:13px;font-weight:700;color:#e65100;">💰 S/. ${saldo.toFixed(2)}</span>` : ''}
+                        ${tieneCredito ? `<span style="background:#fff3e0;border:1.5px solid #ffb74d;border-radius:8px;padding:3px 9px;font-size:13px;font-weight:700;color:#e65100;">💰 S/. ${saldoTotal.toFixed(2)}</span>` : ''}
                         ${bvMap.b10>0 ? `<span style="background:#fff8e1;border:1.5px solid #ffd54f;border-radius:8px;padding:3px 9px;font-size:13px;font-weight:700;color:#e65100;">🪣 ${bvMap.b10} vacío${bvMap.b10!==1?'s':''} 10kg</span>` : ''}
                         ${bvMap.b5>0  ? `<span style="background:#fff8e1;border:1.5px solid #ffd54f;border-radius:8px;padding:3px 9px;font-size:13px;font-weight:700;color:#1565c0;">🪣 ${bvMap.b5} vacío${bvMap.b5!==1?'s':''} 5kg</span>` : ''}
                         ${bvMap.b45>0 ? `<span style="background:#fff8e1;border:1.5px solid #ffd54f;border-radius:8px;padding:3px 9px;font-size:13px;font-weight:700;color:#c62828;">🪣 ${bvMap.b45} vacío${bvMap.b45!==1?'s':''} 45kg</span>` : ''}
@@ -8521,24 +8656,26 @@ ${lista}
                 const g = dirMap[d];
                 const bvM = {b10:0,b5:0,b45:0};
                 (g.fierrosDir||[]).forEach(f=>{const p=Math.max(0,(f.cantidad||0)-(f.devueltos||0));if(f.tipo==='c10')bvM.b10+=p;else if(f.tipo==='c5')bvM.b5+=p;else if(f.tipo==='c45')bvM.b45+=p;});
-                seleccionarDireccionPDC(g.credito?g.credito.id:'', d, bvM, g.credito?g.credito.saldo:0);
+                seleccionarDireccionPDC((g.creditosList||[]).map(cr=>cr.id), d, bvM, g.saldoTotal||0);
             }
 
             document.getElementById('modalPagoDesdeCliente').classList.add('active');
         }
 
-        function seleccionarDireccionPDC(crId, dir, bvMap, saldo) {
+        function seleccionarDireccionPDC(creditoIds, dir, bvMap, saldo) {
+            // creditoIds puede ser un array de ids o un id único (retrocompatibilidad)
+            if (!Array.isArray(creditoIds)) creditoIds = creditoIds ? [creditoIds] : [];
             // Resaltar seleccionada
             document.querySelectorAll('#pdcListaDirecciones > div').forEach(el => {
                 el.style.border = '2px solid #e0e0e0'; el.style.background = 'white';
             });
-            const key = crId || dir.replace(/[^a-z0-9]/gi,'_');
-            const el = document.getElementById('pdcDir_' + key);
+            const dirKey = dir.replace(/[^a-z0-9]/gi,'_');
+            const el = document.getElementById('pdcDir_' + dirKey);
             if (el) { el.style.border = '2px solid #2d5016'; el.style.background = '#e8f5e9'; }
 
-            document.getElementById('pdcCreditoId').value = crId || '';
+            document.getElementById('pdcCreditoId').value = creditoIds[0] || '';
             const bvTotal = (bvMap.b10||0)+(bvMap.b5||0)+(bvMap.b45||0);
-            document.getElementById('pdcTipoPendiente').value = JSON.stringify({ bvMap, bvTotal, saldo, dir });
+            document.getElementById('pdcTipoPendiente').value = JSON.stringify({ bvMap, bvTotal, saldo, dir, creditoIds });
 
             // Resumen
             let resumen = `📍 ${dir}`;
@@ -8549,6 +8686,23 @@ ${lista}
             // Activar formulario
             document.getElementById('pdcFormularioPago').style.opacity = '1';
             document.getElementById('pdcFormularioPago').style.pointerEvents = 'auto';
+
+            // Mostrar u ocultar checkbox de devolución de balones vacíos
+            const bvWrap = document.getElementById('pdcConfirmarBVWrap');
+            const bvCheck = document.getElementById('pdcConfirmarDevolucionBV');
+            const bvResumen = document.getElementById('pdcResumenBV');
+            if (bvTotal > 0 && bvWrap) {
+                bvWrap.style.display = 'block';
+                if (bvCheck) bvCheck.checked = false; // siempre desmarcado por defecto
+                let bvDesc = [];
+                if ((bvMap.b10||0) > 0) bvDesc.push(`${bvMap.b10} vacío${bvMap.b10!==1?'s':''} 10kg`);
+                if ((bvMap.b5||0)  > 0) bvDesc.push(`${bvMap.b5} vacío${bvMap.b5!==1?'s':''} 5kg`);
+                if ((bvMap.b45||0) > 0) bvDesc.push(`${bvMap.b45} vacío${bvMap.b45!==1?'s':''} 45kg`);
+                if (bvResumen) bvResumen.textContent = 'Pendientes: ' + bvDesc.join(', ');
+            } else if (bvWrap) {
+                bvWrap.style.display = 'none';
+                if (bvCheck) bvCheck.checked = false;
+            }
 
             // Pre-llenar con el saldo si hay crédito
             if (saldo > 0) {
@@ -8580,27 +8734,41 @@ ${lista}
                 if (ts) pdcTrab.value = ts.id;
             }
             const pdcTrabOpt = pdcTrab?.options[pdcTrab.selectedIndex];
+            // Obtener lista de IDs de créditos de esta dirección
+            const creditoIds = tipoPendiente.creditoIds || (id ? [id] : []);
             const creditos = Storage.getArray('creditos');
-            const cr = creditos.find(x => x.id === id);
-            // Registrar pago de crédito si corresponde
-            if (id && monto > 0) {
-                if (monto > cr.saldo) { showNotification('El pago excede el saldo', 'error'); return; }
-                cr.saldo -= monto;
-                if (!cr.pagos) cr.pagos = [];
-                cr.pagos.push({
-                    monto, fecha: getCurrentDateTime(),
-                    efectivo: pagos.efectivo, yape: pagos.yape, recibos: pagos.recibos, valesFISE: pagos.valesFISE,
-                    usuario: currentUser.nombre, usuarioId: currentUser.id,
-                    trabajadorId: pdcTrab?.value ? parseInt(pdcTrab.value) : null,
-                    trabajadorNombre: pdcTrabOpt?.dataset.nombre || '',
-                    trabajadorCodigo: pdcTrabOpt?.dataset.codigo || ''
+            // Registrar pago distribuido entre los créditos de esta dirección (del más antiguo al más nuevo)
+            if (creditoIds.length > 0 && monto > 0) {
+                const creditosDir = creditoIds
+                    .map(cid => creditos.find(x => x.id === cid))
+                    .filter(Boolean)
+                    .sort((a,b) => (a.fecha||'').localeCompare(b.fecha||''));
+                const saldoTotalDir = creditosDir.reduce((s,cr) => s + (cr.saldo||0), 0);
+                if (monto > saldoTotalDir + 0.01) { showNotification('El pago excede el saldo total de esta dirección', 'error'); return; }
+                let resto = monto;
+                creditosDir.forEach(cr => {
+                    if (resto <= 0) return;
+                    const pagar = Math.min(resto, cr.saldo);
+                    if (pagar <= 0) return;
+                    cr.saldo = Math.max(0, cr.saldo - pagar);
+                    if (!cr.pagos) cr.pagos = [];
+                    cr.pagos.push({
+                        monto: pagar, fecha: getCurrentDateTime(),
+                        efectivo: pagos.efectivo, yape: pagos.yape, recibos: pagos.recibos, valesFISE: pagos.valesFISE,
+                        usuario: currentUser.nombre, usuarioId: currentUser.id,
+                        trabajadorId: pdcTrab?.value ? parseInt(pdcTrab.value) : null,
+                        trabajadorNombre: pdcTrabOpt?.dataset.nombre || '',
+                        trabajadorCodigo: pdcTrabOpt?.dataset.codigo || ''
+                    });
+                    if (cr.saldo <= 0.01) { cr.saldo = 0; cr.estado = 'pagado'; }
+                    resto -= pagar;
                 });
-                if (cr.saldo <= 0.01) { cr.saldo = 0; cr.estado = 'pagado'; }
                 Storage.set('creditos', creditos);
             }
-            // Registrar devolución de balones vacíos si corresponde
+            // Registrar devolución de balones vacíos SOLO si el usuario confirmó la devolución
             const bvMap = tipoPendiente.bvMap || {};
-            if ((bvMap.b10||0)+(bvMap.b5||0)+(bvMap.b45||0) > 0) {
+            const usuarioConfirmoBV = document.getElementById('pdcConfirmarDevolucionBV')?.checked === true;
+            if (usuarioConfirmoBV && (bvMap.b10||0)+(bvMap.b5||0)+(bvMap.b45||0) > 0) {
                 // Marcar fierros de esta dirección como devueltos
                 const dir = tipoPendiente.dir || '';
                 const fierrosAll = Storage.getArray('fierrosMeDeben');
@@ -8629,7 +8797,7 @@ ${lista}
             cerrarModal('modalPagoDesdeCliente');
             const msgs = [];
             if (monto > 0) msgs.push(`Pago de S/. ${monto.toFixed(2)} registrado`);
-            if ((bvMap.b10||0)+(bvMap.b5||0)+(bvMap.b45||0) > 0) msgs.push('Balones devueltos registrados');
+            if (usuarioConfirmoBV && (bvMap.b10||0)+(bvMap.b5||0)+(bvMap.b45||0) > 0) msgs.push('Balones devueltos registrados');
             showNotification(msgs.join(' · ') || 'Registrado correctamente', 'success');
             renderClientes();
             // Refrescar cierre de caja si está activo para reflejar el cobro al instante
@@ -12397,25 +12565,43 @@ ${lista}
             });
         }
 
-        function repararRegistrosFierros() {
+        function repararRegistrosFierros(silencioso = false) {
             const clientes = Storage.getArray('clientes');
             const norm = s => String(s||'').trim().toLowerCase()
-                .normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ');
+                .normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/\s+/g,' ');
 
-            // Reparar fierrosMeDeben
+            // 1. Reparar clienteId faltante en fierrosMeDeben
             let listaMeDeben = Storage.getArray('fierrosMeDeben');
             let reparadosMeDeben = 0;
             listaMeDeben = listaMeDeben.map(r => {
-                if (r.clienteId) return r; // ya tiene ID, no tocar
+                if (r.clienteId) return r;
                 const nombreReg = norm(r.tercero || r.clienteNombre || '');
                 if (!nombreReg) return r;
                 const cli = clientes.find(c => norm(c.nombre) === nombreReg);
                 if (cli) { reparadosMeDeben++; return { ...r, clienteId: cli.id }; }
                 return r;
             });
+
+            // 2. Revertir devoluciones automaticas incorrectas en fierrosMeDeben
+            // Si devueltos > 0 pero NO hay historialDev ni fechaDevReal
+            // fue marcado automaticamente por el bug, no por devolucion real
+            let revertidosMeDeben = 0;
+            listaMeDeben = listaMeDeben.map(r => {
+                const tieneDevueltos = (r.devueltos || 0) > 0;
+                const tieneHistorial = Array.isArray(r.historialDev) && r.historialDev.length > 0;
+                const tieneFechaDevReal = !!r.fechaDevReal;
+                if (tieneDevueltos && !tieneHistorial && !tieneFechaDevReal) {
+                    revertidosMeDeben++;
+                    return { ...r, devueltos: 0, estado: 'pendiente', fechaDevReal: '' };
+                }
+                if (!tieneDevueltos && (r.estado === 'devuelto' || r.estado === 'parcial')) {
+                    return { ...r, estado: 'pendiente' };
+                }
+                return r;
+            });
             Storage.set('fierrosMeDeben', listaMeDeben);
 
-            // Reparar fierrosDebo
+            // 3. Reparar clienteId faltante en fierrosDebo
             let listaDebo = Storage.getArray('fierrosDebo');
             let reparadosDebo = 0;
             listaDebo = listaDebo.map(r => {
@@ -12426,9 +12612,23 @@ ${lista}
                 if (cli) { reparadosDebo++; return { ...r, clienteId: cli.id }; }
                 return r;
             });
+            let revertidosDebo = 0;
+            listaDebo = listaDebo.map(r => {
+                const tieneDevueltos = (r.devueltos || 0) > 0;
+                const tieneHistorial = Array.isArray(r.historialDev) && r.historialDev.length > 0;
+                const tieneFechaDevReal = !!r.fechaDevReal;
+                if (tieneDevueltos && !tieneHistorial && !tieneFechaDevReal) {
+                    revertidosDebo++;
+                    return { ...r, devueltos: 0, estado: 'pendiente', fechaDevReal: '' };
+                }
+                if (!tieneDevueltos && (r.estado === 'pagado' || r.estado === 'parcial')) {
+                    return { ...r, estado: 'pendiente' };
+                }
+                return r;
+            });
             Storage.set('fierrosDebo', listaDebo);
 
-            // Reparar balonesVacios legacy en clientes (sincronizar con fierrosMeDeben)
+            // 4. Resincronizar balonesVacios de clientes
             let clientesReparados = 0;
             const clientesAct = Storage.getArray('clientes').map(c => {
                 const pendientes = listaMeDeben
@@ -12449,11 +12649,19 @@ ${lista}
             });
             Storage.set('clientes', clientesAct);
 
-            const total = reparadosMeDeben + reparadosDebo;
-            if (total === 0) {
-                showNotification('✅ Todo estaba en orden, no había nada que reparar', 'info');
-            } else {
-                showNotification(`✅ Reparados: ${reparadosMeDeben} en "Me deben", ${reparadosDebo} en "Debo", ${clientesReparados} clientes sincronizados`, 'success');
+            const totalRevertidos = revertidosMeDeben + revertidosDebo;
+            const totalClienteId  = reparadosMeDeben + reparadosDebo;
+
+            if (!silencioso) {
+                if (totalRevertidos === 0 && totalClienteId === 0) {
+                    showNotification('✅ Todo estaba en orden, no habia nada que reparar', 'info');
+                } else {
+                    let msg = '✅ Reparacion completada:';
+                    if (totalRevertidos > 0) msg += ' ' + totalRevertidos + ' devolucion(es) incorrecta(s) revertida(s)';
+                    if (totalClienteId  > 0) msg += ' - ' + totalClienteId + ' ID(s) de cliente asignado(s)';
+                    if (clientesReparados > 0) msg += ' - ' + clientesReparados + ' cliente(s) sincronizado(s)';
+                    showNotification(msg, 'success');
+                }
             }
             renderFierros();
         }
@@ -12523,7 +12731,6 @@ ${lista}
                     <h2>🔧 FIERROS — CILINDROS DE GAS</h2>
                     <div style="display:flex;gap:10px;flex-wrap:wrap;">
                         <button onclick="mostrarInventarioGeneral()" class="btn btn-primary" style="background:linear-gradient(135deg,#0e6b7a,#1a8a9a);font-size:15px;">📦 Resumen Inventario</button>
-                        <button onclick="repararRegistrosFierros()" class="btn btn-warning" style="font-size:15px;">🔨 Reparar Registros</button>
                         <button onclick="backToMenu()" class="btn btn-secondary">← VOLVER</button>
                     </div>
                 </div>
@@ -15668,7 +15875,7 @@ ${lista}
                             if (!val) return;
                             const localRaw = Storage.get(k);
                             if (JSON.stringify(localRaw) !== JSON.stringify(val)) {
-                                localStorage.setItem(lsKey(k), JSON.stringify(val));
+                                IDBStore.setSync(lsKey(k), JSON.stringify(val));
                             }
                         }).catch(() => {});
                     });
